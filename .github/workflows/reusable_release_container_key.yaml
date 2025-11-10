@@ -1,0 +1,326 @@
+name: Build container images with keys
+
+on:
+  workflow_call:
+    inputs:
+      git_tag:
+        required: false
+        type: string
+    secrets:
+      gh_token:
+        description: 'GitHub Token for authentication'
+        required: true
+      cosign_password:
+        description: 'Password of Sigstore private key'
+        required: true
+      sigstore_private_key:
+        description: 'Sigstore private key'
+        required: true
+
+env:
+  IMAGE_TAG: zig-key
+
+jobs:
+  build:
+    name: Build
+    permissions:
+      packages: write # Push container images to ghcr.io.
+    runs-on: ubuntu-24.04
+    outputs:
+      github_repository_lc: ${{ steps.github_repository.outputs.lc }}
+      digest: ${{ steps.image_manifest_ghcr.outputs.digest }}
+      image_tag: ${{ steps.image_ghcr.outputs.tag }}
+    steps:
+      - name: Check buildah version
+        id: buildah_version
+        run: |
+          installed_version=$(buildah version --json | jq -r '.version')
+          minimum_required_version='1.35.0'
+          if dpkg --compare-versions "$installed_version" lt "$minimum_required_version"; then
+              printf '%s=%s\n' 'is_old' 'true' >> "$GITHUB_OUTPUT"
+          fi
+
+      # Workaround: Ubuntu 24.04 does not have 1.35.0 version of buildah yet. Which introduces annotation support for image manifests.
+      - name: Build buildah from sources
+        if: ${{ steps.buildah_version.outputs.is_old }}
+        env:
+          BUILDAH_BRANCH: release-1.42
+        run: |
+          sudo apt-get -y remove buildah
+          sudo apt-get update -y
+          sudo apt-get install -y \
+              bats \
+              btrfs-progs \
+              git \
+              go-md2man \
+              golang \
+              libapparmor-dev \
+              libglib2.0-dev \
+              libgpgme11-dev \
+              libseccomp-dev \
+              libselinux1-dev \
+              make \
+              runc \
+              skopeo \
+              libbtrfs-dev
+          git clone --branch "$BUILDAH_BRANCH" --depth 1 --single-branch https://github.com/containers/buildah
+          cd buildah
+          make
+          sudo make install
+
+      - name: Output version of installed buildah
+        run: buildah version
+
+      # Workaround for buildah: https://github.com/actions/runner-images/issues/10443
+      - name: Workaround for Ubuntu 24.04 LTS
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad # v4.0.0
+
+      - name: Create a blob
+        id: blob
+        run: |
+          zig_mirror=$(curl -fsSL https://ziglang.org/download/community-mirrors.txt | shuf -n 1)
+          zig_version=$(curl -fsSL https://ziglang.org/download/index.json | jq -r '.master.version')
+          zig_tarball_x86_64_linux_master="zig-x86_64-linux-${zig_version}.tar.xz"
+          curl -fsSL "${zig_mirror}/${zig_tarball_x86_64_linux_master}" -o "$zig_tarball_x86_64_linux_master"
+          printf '%s=%s\n' 'zig_tarball_x86_64_linux_master' "$zig_tarball_x86_64_linux_master" >> "$GITHUB_OUTPUT"
+
+      - name: Build a container image
+        id: image
+        run: |
+          buildah unshare ./zig_container.sh ${{ steps.blob.outputs.zig_tarball_x86_64_linux_master }}
+          image_id=$(cat ./image_id.txt)
+          printf '%s=%s\n' 'id' "$image_id" >> "$GITHUB_OUTPUT"
+
+      - name: Create a image manifest
+        id: image_manifest_local
+        env:
+          MANIFEST_NAME: zig
+        run: |
+          image_manifest_local_imageid=$(buildah manifest create \
+              --annotation \
+              "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+              ${GITHUB_REPOSITORY##*/}:${MANIFEST_NAME})
+          printf '%s=%s\n' 'id' "$image_manifest_local_imageid" >> "$GITHUB_OUTPUT"
+
+      - name: Add image into image manifest
+        run: |
+          buildah manifest add ${{ steps.image_manifest_local.outputs.id }} ${{ steps.image.outputs.id }}
+          buildah images # DEBUG: List images and image manifests
+          buildah manifest inspect ${{ steps.image_manifest_local.outputs.id }} # DEBUG: Inspect image manifest
+
+      - name: Login to GHCR.io
+        run: |
+          # GitHub-hosted runners already have a ${HOME}/.docker/config.json with a credential which has unlimited pull rate and limit on Docker Hub.
+          # Append the new credential to the same file and tell buildah and its friends (podman, skopeo etc.) to use it.
+          printf '%s' "${{ secrets.gh_token }}" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          printf '%s=%s\n' 'REGISTRY_AUTH_FILE' "${HOME}/.docker/config.json" >> "$GITHUB_ENV"
+
+      - name: Push image manifest into versioned tag on ghcr.io
+        id: image_manifest_ghcr
+        run: |
+          buildah manifest push \
+              --digestfile image_manifest_ghcr_digest.txt \
+              ${{ steps.image_manifest_local.outputs.id }} \
+              docker://ghcr.io/${GITHUB_REPOSITORY,,}/${IMAGE_TAG}:${{ inputs.git_tag }}
+          image_manifest_ghcr_digest=$(cat ./image_manifest_ghcr_digest.txt)
+          printf '%s=%s\n' 'digest' "$image_manifest_ghcr_digest" >> "$GITHUB_OUTPUT"
+
+      - name: Sign image manifest on ghcr.io
+        env:
+          COSIGN_PASSWORD: ${{ secrets.cosign_password }}
+          SIGSTORE_PRIVATE_KEY: ${{ secrets.sigstore_private_key }}
+        run: |
+          cosign sign \
+              --key env://SIGSTORE_PRIVATE_KEY \
+              --recursive \
+              --yes \
+              ghcr.io/${GITHUB_REPOSITORY,,}/${IMAGE_TAG}@${{ steps.image_manifest_ghcr.outputs.digest }}
+
+      - name: Create lowercase version of GITHUB_REPOSITORY as a step output
+        id: github_repository
+        run: printf '%s=%s\n' 'lc' "${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Create image tag as a step output
+        id: image_ghcr
+        run: printf '%s=%s\n' 'tag' "$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Generate SBOM for container image
+        uses: anchore/sbom-action@8e94d75ddd33f69f691467e42275782e4bfefe84 # v0.20.9
+        with:
+          image: ghcr.io/${{ steps.github_repository.outputs.lc }}/${{ steps.image_ghcr.outputs.tag }}@${{ steps.image_manifest_ghcr.outputs.digest }}
+          artifact-name: zig-key.spdx.json
+          output-file: ./zig-key.spdx.json
+
+      - name: Attest SBOM
+        env:
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+          SIGSTORE_PRIVATE_KEY: ${{ secrets.SIGSTORE_PRIVATE_KEY }}
+        run: |
+          cosign attest \
+              --key env://SIGSTORE_PRIVATE_KEY \
+              --predicate zig-key.spdx.json \
+              --type spdxjson \
+              --yes \
+              ghcr.io/${GITHUB_REPOSITORY,,}/${IMAGE_TAG}@${{ steps.image_manifest_ghcr.outputs.digest }}
+
+      - name: Push image manifest into latest tag too
+        run: |
+          buildah manifest push \
+              ${{ steps.image_manifest_local.outputs.id }} \
+              docker://ghcr.io/${GITHUB_REPOSITORY,,}/${IMAGE_TAG}:latest
+
+      - name: Logout from ghcr.io
+        if: ${{ always() }}
+        run: docker logout ghcr.io || true
+
+  provenance:
+    name: Generate provenance
+    permissions:
+      actions: read # for detecting the Github Actions environment.
+      id-token: write # for creating OIDC tokens for signing.
+      packages: write # for uploading attestations.
+    needs:
+      - build
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml@v2.1.0 # https://github.com/slsa-framework/slsa-verifier/issues/12
+    with:
+      image: ghcr.io/${{ needs.build.outputs.github_repository_lc }}/${{ needs.build.outputs.image_tag }}
+      digest: ${{ needs.build.outputs.digest }}
+      registry-username: ${{ github.actor }}
+    secrets:
+      registry-password: ${{ secrets.gh_token }}
+
+  artifact_attestations:
+    name: Generate Artifact attestations
+    permissions:
+      id-token: write # Needed for Artifact attestations.
+      attestations: write # Upload to Artifact attestations.
+    needs:
+      - build
+    runs-on: ubuntu-24.04
+    outputs:
+      artifact_attestation_url: ${{ steps.attest_provenance.outputs.attestation-url }}
+      sbom_attestation_url: ${{ steps.attest_sbom.outputs.attestation-url }}
+    steps:
+      - name: Download Build Artifacts
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+
+      - name: Generate artifact attestation
+        id: attest_provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-name: ghcr.io/${{ needs.build.outputs.github_repository_lc }}/${{ needs.build.outputs.image_tag }}
+          subject-digest: ${{ needs.build.outputs.digest }}
+
+      - name: Attest SBOM
+        uses: actions/attest-sbom@4651f806c01d8637787e274ac3bdf724ef169f34 # v3.0.0
+        id: attest_sbom
+        with:
+          subject-name: ghcr.io/${{ needs.build.outputs.github_repository_lc }}/${{ needs.build.outputs.image_tag }}
+          subject-digest: ${{ needs.build.outputs.digest }}
+          sbom-path: ./zig-key.spdx.json
+
+  verify:
+    name: Verify
+    needs:
+      - build
+      - provenance
+      - artifact_attestations
+    runs-on: ubuntu-24.04
+    env:
+      SIGSTORE_PUBLIC_KEY: sigstore.pub
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad # v4.0.0
+
+      - name: Verify image manifest with public key and sigstore bundle
+        run: |
+          cosign verify \
+              --key "$SIGSTORE_PUBLIC_KEY" \
+              --output-file cosign_verify_output.log \
+              ghcr.io/${GITHUB_REPOSITORY,,}/${IMAGE_TAG}@${{ needs.build.outputs.digest }}
+
+      - name: Output verification output # DEBUG
+        run: jq '.' cosign_verify_output.log
+
+      - name: Verify attested SBOM
+        run: |
+          cosign verify-attestation \
+              --key "$SIGSTORE_PUBLIC_KEY" \
+              --type spdxjson \
+              --output-file cosign_verify_attestation_sbom_output.log \
+              ghcr.io/${GITHUB_REPOSITORY,,}/${IMAGE_TAG}@${{ needs.build.outputs.digest }}
+
+      - name: Output verified SBOM # DEBUG
+        run: jq -r '.payload' cosign_verify_attestation_sbom_output.log | base64 --decode | jq
+
+      - name: Install SLSA verifier
+        uses: slsa-framework/slsa-verifier/actions/installer@ea584f4502babc6f60d9bc799dbbb13c1caa9ee6 # v2.7.1
+
+      - name: Verify Provenance
+        run: |
+          slsa-verifier verify-image \
+              ghcr.io/${GITHUB_REPOSITORY,,}/${IMAGE_TAG}@${{ needs.build.outputs.digest }} \
+              --print-provenance \
+              --source-uri "${GITHUB_SERVER_URL##*/}/${GITHUB_REPOSITORY}"
+
+      - name: Verify Artifact attestation
+        env:
+          GH_TOKEN: ${{ secrets.gh_token }}
+          GH_FORCE_TTY: true
+        run: |
+          gh attestation verify \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-repo LKHN/sscs-reusable-workflows \
+              --format json \
+              oci://ghcr.io/${GITHUB_REPOSITORY,,}/${IMAGE_TAG}@${{ needs.build.outputs.digest }}
+
+  release:
+    name: Release
+    permissions:
+      contents: write # Create GitHub Release.
+    needs:
+      - build
+      - provenance
+      - artifact_attestations
+      - verify
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Write release notes with transparency logs
+        run: |
+          cat > release_notes.md <<EOF
+          - **Workflow Run:** ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+          - **Artifact Attestations:**
+            - Artifact attestation: ${{ needs.artifact_attestations.outputs.artifact_attestation_url }}
+            - SBOM attestation: ${{ needs.artifact_attestations.outputs.sbom_attestation_url }}
+          - **Container Image Digest:**
+          \`\`\`
+          ghcr.io/${GITHUB_REPOSITORY,,}/${IMAGE_TAG}@${{ needs.build.outputs.digest }}
+          \`\`\`
+          - **Container Image Tag:**
+          \`\`\`
+          ghcr.io/${GITHUB_REPOSITORY,,}/${IMAGE_TAG}:${{ inputs.git_tag }}
+          \`\`\`
+          EOF
+
+      - name: Release a blob with Sigstore Bundle SBOM and SLSA provenance
+        if: ${{ inputs.git_tag }}
+        env:
+          GH_TOKEN: ${{ secrets.gh_token }}
+        run: |
+          gh release create \
+              container_key/${{ inputs.git_tag }} \
+              --generate-notes \
+              --notes-file release_notes.md \
+              --title "Release of container images signed with keys ${{ inputs.git_tag }}"
